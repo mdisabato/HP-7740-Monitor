@@ -4,8 +4,11 @@
   "ha_server_id": "<id of your Home Assistant server config node>",
   "mqtt_broker_id": "<id of your MQTT broker config node>",
   "topic_base": "hp7740",
-  "ignore_trays": ["Tray2"],
+  "ignore_trays": [
+    "Tray2"
+  ],
   "snmp_community": "public",
-  "poll_seconds": 60,
-  "boot_delay_seconds": 45
+  "poll_seconds": 15,
+  "boot_delay_seconds": 45,
+  "ink_every_polls": 4
 }

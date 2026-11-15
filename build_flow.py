@@ -13,7 +13,8 @@ BROKER = CFG['mqtt_broker_id']      # MQTT broker config node
 BASE = CFG.get('topic_base', 'hp7740')
 IGNORE_TRAYS = CFG.get('ignore_trays', [])
 COMMUNITY = CFG.get('snmp_community', 'public')
-POLL = str(CFG.get('poll_seconds', 60))
+POLL = str(CFG.get('poll_seconds', 15))            # status page + SNMP
+INK_EVERY = int(CFG.get('ink_every_polls', 4))      # consumables page every Nth poll
 BOOT = str(CFG.get('boot_delay_seconds', 45))
 
 F_LINK = r"""// Switch port link = printer power. The printer's NIC powers down when it is off.
@@ -30,14 +31,18 @@ node.status({fill: on ? 'green' : 'grey', shape: 'dot', text: status});
 return [{topic: 'BASE/power', payload: power}, on ? {payload: 'first poll'} : null];
 """.replace('BASE', BASE)
 
-F_GATE = r"""// Poll only while the link is up.
+F_GATE = r"""// Poll only while the link is up. Status page + SNMP every poll; ink every INK_EVERY polls.
 if (flow.get('link') !== 'on') return null;
-msg.url = 'http://HOST/DevMgmt/ConsumableConfigDyn.xml';
+const n = (flow.get('polls') || 0);
+flow.set('polls', n + 1);
+const full = msg.payload === 'first poll' || n % INK_EVERY === 0 || !flow.get('ink');
 msg.method = 'GET';
 msg.requestTimeout = 8000;
-msg.poll = {started: Date.now()};
-return msg;
-""".replace('HOST', HOST)
+msg.poll = {started: Date.now(), full};
+if (full) { msg.url = 'http://HOST/DevMgmt/ConsumableConfigDyn.xml'; return [msg, null]; }
+msg.url = 'http://HOST/DevMgmt/ProductStatusDyn.xml';
+return [null, msg];
+""".replace('HOST', HOST).replace('INK_EVERY', str(INK_EVERY))
 
 F_CONS = r"""// Ink levels from the printer's consumables page.
 if (msg.statusCode !== 200) { node.error('consumables page: HTTP ' + msg.statusCode, msg); return null; }
@@ -59,6 +64,7 @@ for (const m of x.matchAll(/<ccdyn:ConsumableInfo>([\s\S]*?)<\/ccdyn:ConsumableI
     ink[c] = {pct: pct === undefined ? null : Number(pct), level, brand: lg('Brand') || null};
 }
 msg.poll.ink = ink;
+flow.set('ink', ink);
 msg.url = 'http://HOST/DevMgmt/ProductStatusDyn.xml';
 return msg;
 """.replace('HOST', HOST)
@@ -93,8 +99,15 @@ const prt = Number(vb['1.3.6.1.2.1.25.3.5.1.1.1']);          // hrPrinterStatus
 const up = Number(vb['1.3.6.1.2.1.1.3.0']);                  // sysUpTime, 1/100 s
 const pages = vb['1.3.6.1.2.1.43.10.2.1.4.1.1'];             // prtMarkerLifeCount
 const p = msg.poll;
-let status = {1: 'other', 2: 'unknown', 3: 'idle', 4: 'printing', 5: 'warming up'}[prt] || 'unknown';
-if (status === 'idle' && p.categories.includes('inPowerSave')) status = 'sleep';
+p.ink = p.ink || flow.get('ink') || {};
+// Mode from the printer's status categories (what the front panel shows), most specific first.
+const MODES = [['cancelJob', 'cancelling'], ['scanProcessing', 'scanning'], ['scanning', 'scanning'],
+               ['copying', 'copying'], ['faxSending', 'faxing'], ['faxReceiving', 'faxing'],
+               ['printing', 'printing'], ['processing', 'printing'], ['initializing', 'warming up'],
+               ['busy', 'busy'], ['inPowerSave', 'sleep'], ['ready', 'ready']];
+const hit = MODES.find(([c]) => p.categories.includes(c));
+let status = hit ? hit[1] : ({3: 'ready', 4: 'printing', 5: 'warming up'}[prt] || 'unknown');
+if (!hit) node.warn('no known mode in categories: ' + p.categories.join(', '));
 const now = Date.now();
 const supplies = {
     ink_cyan: p.ink.cyan ? p.ink.cyan.pct : null,
@@ -107,13 +120,15 @@ const supplies = {
     alert: p.alerts.length ? p.alerts.map(a => a.id + (a.detail ? ' (' + a.detail + ')' : '')).join(', ') : 'none',
     alerts: p.alerts,
     categories: p.categories,
-    powered_on: isNaN(up) ? null : new Date(now - up * 10).toISOString(),
+    powered_on: isNaN(up) ? null : new Date(Math.round((now - up * 10) / 60000) * 60000).toISOString(),
     updated: new Date(now).toISOString(),
 };
 const changedStatus = flow.get('status') !== status;
 flow.set('status', status);
 node.status({fill: 'green', shape: 'dot', text: status + ', black ' + supplies.ink_black + '%'});
-const out = [{topic: 'BASE/supplies', payload: supplies}];
+const key = JSON.stringify(Object.assign({}, supplies, {updated: null}));
+const out = [];
+if (key !== flow.get('supplies_key') || p.full) { flow.set('supplies_key', key); out.push({topic: 'BASE/supplies', payload: supplies}); }
 if (changedStatus) out.push({topic: 'BASE/power', payload: {power: 'on', status, changed: new Date(now).toISOString()}});
 return [out];
 """.replace('BASE', BASE)
@@ -164,7 +179,7 @@ def http(id_, name, x, y, wires):
 
 
 nodes = [
-    {'id': 'hp7740_cmt', 'type': 'comment', 'z': TAB, 'name': 'HP 7740 monitor: power from the switch port link; while on, status pages (HTTP) + SNMP every ' + POLL + ' s; published to MQTT ' + BASE + '/power and ' + BASE + '/supplies (retained) with HA discovery',
+    {'id': 'hp7740_cmt', 'type': 'comment', 'z': TAB, 'name': 'HP 7740 monitor: power from the switch port link; while on, status pages (HTTP) + SNMP every ' + POLL + ' s (ink every ' + str(INK_EVERY) + ' polls); published to MQTT ' + BASE + '/power and ' + BASE + '/supplies (retained) with HA discovery',
      'info': 'Replaces the HACS hpprinter integration. Ignores non-HP cartridge, firmware and web-services nags and empty ignored trays.', 'x': 520, 'y': 40, 'wires': []},
     # discovery
     {'id': 'hp7740_disc_inj', 'type': 'inject', 'z': TAB, 'name': 'publish discovery at start', 'props': [{'p': 'payload'}],
@@ -189,7 +204,7 @@ nodes = [
     {'id': 'hp7740_tick', 'type': 'inject', 'z': TAB, 'name': 'every ' + POLL + ' s', 'props': [{'p': 'payload'}],
      'repeat': POLL, 'crontab': '', 'once': True, 'onceDelay': '20', 'topic': '', 'payload': '', 'payloadType': 'date',
      'x': 150, 'y': 260, 'wires': [['hp7740_gate']]},
-    fn('hp7740_gate', 'Poll if powered', F_GATE, 400, 260, [['hp7740_h1']]),
+    fn('hp7740_gate', 'Poll if powered', F_GATE, 400, 260, [['hp7740_h1'], ['hp7740_h2']], outputs=2),
     http('hp7740_h1', 'Consumables page', 600, 260, [['hp7740_fc']]),
     fn('hp7740_fc', 'Parse ink', F_CONS, 790, 260, [['hp7740_h2']]),
     http('hp7740_h2', 'Status page', 600, 320, [['hp7740_fs']]),

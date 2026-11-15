@@ -1,0 +1,11 @@
+{
+  "printer_host": "192.168.1.50",
+  "link_entity": "binary_sensor.switch_port_11_link",
+  "ha_server_id": "<id of your Home Assistant server config node>",
+  "mqtt_broker_id": "<id of your MQTT broker config node>",
+  "topic_base": "hp7740",
+  "ignore_trays": ["Tray2"],
+  "snmp_community": "public",
+  "poll_seconds": 60,
+  "boot_delay_seconds": 45
+}

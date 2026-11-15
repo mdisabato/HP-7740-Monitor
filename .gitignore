@@ -1,0 +1,6 @@
+# local settings and generated files (they contain your hosts and ids)
+settings.json
+flow.json
+funcs.json
+removed/
+.DS_Store
